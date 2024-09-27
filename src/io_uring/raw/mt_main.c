@@ -1,30 +1,46 @@
-/* Vectored I/O with io_uring */
+/* Vectored I/O with io_uring - Multi-threaded; 2 threads with one sending sqes and another receiving cqes*/
 
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
-#include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
-#include <sys/syscall.h>
+#include <threads.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
 
 #include <linux/io_uring.h>
 
-#define NUM_ENTRIES 4
+#define IOV_NUM_ENTRIES 64
+#define QUEUE_DEPTH 240
 #define BLKSZ 4096
 
 static char array[BLKSZ];
-static struct iovec iov[NUM_ENTRIES];
-static char read_path[] = "/tmp/dump.txt";
+static char read_path[] = "/tmp/bigfile.txt";
 void *sq_ptr, *cq_ptr;
 size_t s_ring_sz, c_ring_sz;
+static struct io_uring_params params;
+static char *total_chunk;
+static uint64_t chunk_size;
+static struct iovec iovecs[QUEUE_DEPTH][IOV_NUM_ENTRIES];
 
 static inline void barrier(void)
 {
     asm("mfence" ::: "memory");
 }
+
+typedef struct func_args
+{
+    off_t file_size;
+    int fd;
+    int ring_fd;
+    struct sq_ring *s_ring;
+    struct cq_ring *c_ring;
+} func_args;
 
 struct sq_ring
 {
@@ -58,12 +74,13 @@ static inline int io_uring_enter(int ring_fd, uint32_t to_submit,
     return (int)syscall(__NR_io_uring_enter, ring_fd, to_submit, min_complete, flags, NULL, 0);
 }
 
-static struct io_uring_sqe *init_sqe(struct sq_ring *s_ring, uint64_t off, int fd, uint8_t op)
+static int init_sqe(struct sq_ring *s_ring, uint64_t off, int fd, uint8_t op, struct iovec *iov)
 {
     struct io_uring_sqe *sqe;
     uint32_t tail, index;
 
     tail = *s_ring->tail;
+
     index = tail & (*s_ring->ring_mask);
     sqe = &s_ring->sqes[index];
 
@@ -71,8 +88,8 @@ static struct io_uring_sqe *init_sqe(struct sq_ring *s_ring, uint64_t off, int f
     sqe->fd = fd;
     sqe->off = off;
     sqe->addr = (uint64_t)iov;
-    sqe->len = NUM_ENTRIES;
-    // sqe->user_data = user_data;
+    sqe->len = IOV_NUM_ENTRIES;
+    sqe->user_data = off;
 
     s_ring->array[index] = index;
     tail++; // Advance
@@ -81,12 +98,12 @@ static struct io_uring_sqe *init_sqe(struct sq_ring *s_ring, uint64_t off, int f
     *s_ring->tail = tail;
     barrier();
 
-    return sqe;
+    return EXIT_SUCCESS;
 }
 
-static int consume_cqe(struct cq_ring *c_ring)
+static int _consume_cqe(struct cq_ring *c_ring, struct io_uring_cqe *cqe)
 {
-    struct io_uring_cqe *cqe;
+    // struct io_uring_cqe *cqe;
     uint32_t head, index;
 
     head = *c_ring->head;
@@ -112,7 +129,6 @@ static int consume_cqe(struct cq_ring *c_ring)
 struct sq_ring *init_sq_ring(int ring_fd, struct io_uring_params *p)
 {
     struct sq_ring *s_ring;
-    // void *sq_ptr;
     size_t s_ring_sz;
 
     s_ring_sz = p->sq_off.array + p->sq_entries * sizeof(uint32_t);
@@ -156,8 +172,6 @@ struct sq_ring *init_sq_ring(int ring_fd, struct io_uring_params *p)
 struct cq_ring *init_cq_ring(int ring_fd, struct io_uring_params *p)
 {
     struct cq_ring *c_ring;
-    // void *cq_ptr;
-    // size_t c_ring_sz;
 
     c_ring_sz = p->cq_off.cqes + p->cq_entries * sizeof(struct io_uring_cqe);
     c_ring = malloc(sizeof(struct cq_ring));
@@ -184,7 +198,8 @@ struct cq_ring *init_cq_ring(int ring_fd, struct io_uring_params *p)
     return c_ring;
 }
 
-static void cleanup_allocs(struct sq_ring *s_ring, struct cq_ring *c_ring, struct io_uring_params *params) {
+static void cleanup_allocs(struct sq_ring *s_ring, struct cq_ring *c_ring, struct io_uring_params *params)
+{
     munmap(s_ring->sqes, params->sq_entries * sizeof(struct io_uring_sqe));
     munmap(sq_ptr, s_ring_sz);
     munmap(cq_ptr, c_ring_sz);
@@ -192,17 +207,100 @@ static void cleanup_allocs(struct sq_ring *s_ring, struct cq_ring *c_ring, struc
     free(c_ring);
 }
 
+static int consume_sqe(void *arg)
+{
+    int consumed, ret;
+    uint64_t offset;
+    func_args *f_args = (func_args *)arg;
+    char buf[BLKSZ * IOV_NUM_ENTRIES];
+    struct io_uring_cqe *cqe;
+
+    while (1)
+    {
+        /*
+         * Consume each of the CQEs as required
+         */
+        for (size_t t = 0; consumed >= 0 && t < QUEUE_DEPTH; consumed = _consume_cqe(f_args->c_ring, cqe))
+        {
+            if (consumed == 0)
+                continue;
+
+            /*
+             * Do something with the already read blocks e.g print to console
+             */
+            // memcpy(buf, iovecs[t][0].iov_base, BLKSZ * IOV_NUM_ENTRIES);
+            // printf("%s", buf);
+
+            t++;
+            // memset((uint64_t*)buf, 0, BLKSZ * IOV_NUM_ENTRIES);
+        }
+
+        offset += (BLKSZ * IOV_NUM_ENTRIES * QUEUE_DEPTH);
+
+        if (consumed == -1) // Error
+        {
+            perror("consume_cqe");
+            return EXIT_FAILURE;
+        }
+        else if (consumed < -2) // Error
+        {
+
+            fprintf(stderr, "Error: %s\n", strerror(abs(consumed)));
+            return EXIT_FAILURE;
+        }
+        else if ((consumed == -2 || consumed == 0) && offset >= f_args->file_size) // End of file or empty
+        {
+            printf("\nEmpty or EOF\n");
+            return EXIT_SUCCESS;
+        }
+    }
+}
+
+static int submit_sqe(void *arg)
+{
+    int ret;
+    uint64_t offset;
+    int64_t file_size;
+    func_args *f_args = (func_args *)arg;
+
+    offset = 0;
+    file_size = f_args->file_size;
+    while (file_size > 0)
+    {
+        for (size_t j = 0; j < QUEUE_DEPTH; j++)
+        {
+            int temp = init_sqe(f_args->s_ring, offset, f_args->fd, IORING_OP_READV, iovecs[j]);
+            offset += (BLKSZ * IOV_NUM_ENTRIES);
+        }
+
+        file_size -= (BLKSZ * IOV_NUM_ENTRIES * QUEUE_DEPTH);
+        ret = io_uring_enter(f_args->ring_fd, QUEUE_DEPTH, 1, IORING_ENTER_GETEVENTS);
+        if (ret < 0)
+        {
+            perror("io_uring_enter");
+            return EXIT_FAILURE;
+        }
+    }
+    return EXIT_SUCCESS;
+}
+
 int main(int argc, char *argv[])
 {
-    struct io_uring_params params;
+    clock_t start, end;
+    double cpu_time_used;
     struct sq_ring *s_ring;
     struct cq_ring *c_ring;
     uint64_t offset;
     int fd, ret, consumed;
-    char *total_chunk;
+    char *ptr;
+    char buf[BLKSZ];
+    struct stat finfo;
+    func_args args;
+    thrd_t threads[2];
 
+    start = clock();
     memset(&params, 0, sizeof(params));
-    int ring_fd = io_uring_setup(NUM_ENTRIES, &params);
+    int ring_fd = io_uring_setup(QUEUE_DEPTH, &params);
     if (ring_fd == -1)
     {
         perror("io_uring_setup");
@@ -230,79 +328,57 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
-    offset = 0;
+    if (fstat(fd, &finfo) == -1)
+    {
+        perror("fstat");
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
 
     /* Get vectored buffers in single allocation */
-    total_chunk = malloc(BLKSZ * NUM_ENTRIES);
+    chunk_size = BLKSZ * IOV_NUM_ENTRIES * QUEUE_DEPTH;
+    total_chunk = malloc(chunk_size);
     if (!total_chunk)
     {
         close(fd);
         perror("malloc");
         exit(EXIT_FAILURE);
     }
-    memset(total_chunk, 0, BLKSZ * NUM_ENTRIES);
+    memset((uint64_t *)total_chunk, 0, chunk_size);
+    ptr = total_chunk;
 
-    while (1)
+    /* Fill up the io vector */
+    for (size_t i = 0; i < QUEUE_DEPTH; i++)
     {
-
-        /* Fill up the io vector */
-        for (size_t i = 0; i < NUM_ENTRIES; i++)
+        for (size_t k = 0; k < IOV_NUM_ENTRIES; k++)
         {
-            iov[i].iov_base = total_chunk + (BLKSZ * i);
-            iov[i].iov_len = BLKSZ;
+            iovecs[i][k].iov_base = ptr;
+            iovecs[i][k].iov_len = BLKSZ;
+            ptr = iovecs[i][k].iov_base + BLKSZ;
         }
-
-        init_sqe(s_ring, offset, fd, IORING_OP_READV);
-
-        ret = io_uring_enter(ring_fd, NUM_ENTRIES, 1, IORING_ENTER_GETEVENTS);
-        if (ret < 0)
-        {
-            perror("io_uring_enter");
-            goto exit_error;
-        }
-
-        consumed = consume_cqe(c_ring);
-        for (size_t k = 0; k < NUM_ENTRIES; k++)
-        {
-            printf("%s", (char *)iov[k].iov_base);
-
-            /* Attempt to reset chunk 8 bytes at a time */
-            memset((uint64_t*)total_chunk, 0, BLKSZ * NUM_ENTRIES);
-        }
-
-        if (consumed == -1) // Error
-        {
-
-            perror("consume_cqe");
-            goto exit_error;
-        }
-        else if (consumed < -2) // Error
-        {
-
-            fprintf(stderr, "Error: %s\n", strerror(abs(consumed)));
-            goto exit_error;
-        }
-        else if (consumed == -2) // End of file
-        {
-            break;
-        }
-        else if (consumed == 0) // Empty
-        {
-            break;
-        }
-
-        offset += (BLKSZ * NUM_ENTRIES);
     }
+
+    offset = 0;
+
+    args.fd = fd;
+    args.file_size = finfo.st_size;
+    args.ring_fd = ring_fd;
+    args.c_ring = c_ring;
+    args.s_ring = s_ring;
+
+    thrd_create(&threads[0], submit_sqe, (void *)&args);
+    thrd_create(&threads[1], consume_sqe, (void *)&args);
+
+    thrd_join(threads[0], NULL);
+    thrd_join(threads[1], NULL);
+
     printf("\n");
+    end = clock();
+    cpu_time_used = ((double)(end - start)) / CLOCKS_PER_SEC;
+    printf("Time: %f seconds\n", cpu_time_used);
 
     close(fd);
     free(total_chunk);
     cleanup_allocs(s_ring, c_ring, &params);
     return EXIT_SUCCESS;
-
-exit_error:
-    close(fd);
-    free(total_chunk);
-    cleanup_allocs(s_ring, c_ring, &params);
-    exit(EXIT_FAILURE);
 }

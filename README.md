@@ -1,2 +1,2 @@
-# drive_io
-Doing I/O on Linux using different tools
+# test_uring
+Repo to test and learn io_uring interface
